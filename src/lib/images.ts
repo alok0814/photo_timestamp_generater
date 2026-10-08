@@ -50,25 +50,29 @@ export function drawStamp(
   text: string,
   corner: StampCorner,
 ): void {
-  const fontSize = Math.max(18, Math.round(Math.min(width, height) * 0.042));
-  const pad = Math.round(fontSize * 0.72);
+  const fontSize = Math.max(28, Math.round(Math.min(width, height) * 0.055));
+  const pad = Math.round(fontSize * 0.42);
+  const margin = Math.round(fontSize * 0.5);
   const right = corner.endsWith("right");
   const bottom = corner.startsWith("bottom");
 
   ctx.save();
-  ctx.font = `700 ${fontSize}px "Helvetica Neue", "Hiragino Sans", Arial, sans-serif`;
-  ctx.textAlign = right ? "right" : "left";
-  ctx.textBaseline = bottom ? "bottom" : "top";
-  ctx.lineJoin = "round";
-  ctx.miterLimit = 2;
-  ctx.lineWidth = Math.max(2, fontSize * 0.16);
+  ctx.font = `700 ${fontSize}px "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif`;
+  const textWidth = ctx.measureText(text).width;
+  const boxWidth = Math.ceil(textWidth + pad * 2);
+  const boxHeight = Math.ceil(fontSize + pad * 2);
+  const x = right ? width - margin - boxWidth : margin;
+  const y = bottom ? height - margin - boxHeight : margin;
 
-  const x = right ? width - pad : pad;
-  const y = bottom ? height - pad : pad;
-  ctx.strokeStyle = "rgba(0, 0, 0, 0.82)";
-  ctx.strokeText(text, x, y);
-  ctx.fillStyle = "#ffe14a";
-  ctx.fillText(text, x, y);
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(x, y, boxWidth, boxHeight);
+  ctx.strokeStyle = "#000000";
+  ctx.lineWidth = Math.max(3, fontSize * 0.07);
+  ctx.strokeRect(x, y, boxWidth, boxHeight);
+  ctx.fillStyle = "#000000";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, x + pad, y + boxHeight / 2);
   ctx.restore();
 }
 

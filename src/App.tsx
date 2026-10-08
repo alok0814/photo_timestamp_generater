@@ -11,17 +11,21 @@ import {
   type AlbumDraft,
 } from "./lib/folders";
 import { makeSamplePreview, outputRelativePath, stampFile, type StampCorner } from "./lib/images";
+import { batchFiles, canSharePhotos, isPhone, toPhotoFile } from "./lib/camera";
 import { downloadBlob, zipAlbum } from "./lib/save";
 
 type Phase = "empty" | "loading" | "ready" | "running" | "done";
 
 type ResultState = {
-  saved: { label: string; count: number; where: "folder" | "zip" }[];
+  saved: { label: string; count: number; where: "folder" | "zip" | "camera" }[];
   fileDates: number;
   failures: string[];
   cancelled: boolean;
   fellBackToZip: boolean;
   downloads: { url: string; name: string }[];
+  cameraBatches: File[][];
+  sharedBatches: number;
+  handSave: { url: string; name: string }[];
 };
 
 const CORNERS: { id: StampCorner; label: string }[] = [
@@ -130,6 +134,7 @@ export default function App() {
   function clearResult() {
     setResult((current) => {
       current?.downloads.forEach((item) => URL.revokeObjectURL(item.url));
+      current?.handSave.forEach((item) => URL.revokeObjectURL(item.url));
       return null;
     });
   }
@@ -213,7 +218,7 @@ export default function App() {
     await useAlbums(album ? [album] : []);
   }
 
-  async function processAlbums(list: AlbumDraft[], asZip: boolean) {
+  async function processAlbums(list: AlbumDraft[], mode: "folder" | "zip" | "camera") {
     cancelRef.current = false;
     clearResult();
     setError("");
@@ -225,6 +230,8 @@ export default function App() {
     const failures: string[] = [];
     const saved: ResultState["saved"] = [];
     const downloads: ResultState["downloads"] = [];
+    const cameraFiles: File[] = [];
+    const usedNames = new Set<string>();
 
     for (const album of list) {
       if (cancelRef.current) break;
@@ -232,7 +239,7 @@ export default function App() {
       const zipFiles: { relativePath: string; blob: Blob }[] = [];
       let output: FileSystemDirectoryHandle | null = null;
       let folderWrote = 0;
-      const wantedFolder = !asZip && Boolean(album.handle);
+      const wantedFolder = mode === "folder" && Boolean(album.handle);
       let canWrite = false;
 
       if (wantedFolder && album.handle) {
@@ -249,6 +256,10 @@ export default function App() {
           if (captured.source === "file") fileDates += 1;
           const blob = await stampFile(image.file, formatStamp(captured.date, withTime), corner);
           const relativePath = outputRelativePath(image.relativePath, blob.type);
+          if (mode === "camera") {
+            cameraFiles.push(toPhotoFile(relativePath, blob, usedNames));
+            continue;
+          }
           let stored = false;
           if (canWrite && album.handle) {
             try {
@@ -286,6 +297,15 @@ export default function App() {
       saved.push({ label: zipped.name, count: zipFiles.length, where: "zip" });
     }
 
+    const cameraBatches = mode === "camera" && canSharePhotos(cameraFiles) ? batchFiles(cameraFiles) : [];
+    const handSave =
+      mode === "camera" && cameraBatches.length === 0
+        ? cameraFiles.map((file) => ({ url: URL.createObjectURL(file), name: file.name }))
+        : [];
+    if (cameraFiles.length > 0) {
+      saved.push({ label: "カメラロール", count: cameraFiles.length, where: "camera" });
+    }
+
     setResult({
       saved,
       fileDates,
@@ -293,12 +313,45 @@ export default function App() {
       cancelled: cancelRef.current,
       fellBackToZip,
       downloads,
+      cameraBatches,
+      sharedBatches: 0,
+      handSave,
     });
     setPhase("done");
   }
 
+  async function shareNextBatch() {
+    const batches = result?.cameraBatches ?? [];
+    const index = result?.sharedBatches ?? 0;
+    const files = batches[index];
+    if (!files) return;
+    try {
+      await navigator.share({ files });
+      setResult((current) => (current ? { ...current, sharedBatches: current.sharedBatches + 1 } : current));
+      setError("");
+    } catch (caught) {
+      if (caught instanceof DOMException && caught.name === "AbortError") return;
+      if (files.length > 1) {
+        const middle = Math.ceil(files.length / 2);
+        setResult((current) => {
+          if (!current) return current;
+          const next = [...current.cameraBatches];
+          next.splice(index, 1, files.slice(0, middle), files.slice(middle));
+          return { ...current, cameraBatches: next };
+        });
+        setError("一度に保存できなかったので、枚数を分けました。もう一度押してください。");
+        return;
+      }
+      setError("カメラロールに保存できませんでした。もう一度押してください。");
+    }
+  }
+
   async function onSave() {
     if (phase === "running" || albums.length === 0) return;
+    if (isPhone()) {
+      await processAlbums(albums, "camera");
+      return;
+    }
     let list = albums;
     if (canChooseSaveFolder) {
       try {
@@ -308,97 +361,86 @@ export default function App() {
         setAlbums(list);
       } catch (caught) {
         if (caught instanceof DOMException && caught.name === "AbortError") return;
-        setError("フォルダを選べませんでした。ZIPでも保存できます。");
+        setError("フォルダを選べませんでした。ダウンロードでも保存できます。");
         return;
       }
     }
-    await processAlbums(list, false);
+    await processAlbums(list, "folder");
   }
 
+  const phone = isPhone();
   const busy = phase === "loading" || phase === "running";
   const percent = progress.total === 0 ? 0 : Math.round((progress.current / progress.total) * 100);
 
   return (
     <main className="page">
       <header className="hero">
-        <p className="eyebrow">写真はこの端末の中だけで処理されます</p>
-        <h1>写真に日時を焼き込む</h1>
-        <p className="lede">
-          写真の入ったフォルダをドロップすると、1枚ずつの撮影日時を画像の中へ表示します。元のフォルダの中に、フォルダ名の後ろへ「タイムスタンプ済み」を付けた新しいフォルダを作り、そこへ保存します。
-        </p>
+        <h1>写真に日付を入れます</h1>
+        <p className="lede">上から順に、大きいボタンを押してください。</p>
       </header>
 
-      <section
-        className={dragging ? "drop over" : "drop"}
-        onClick={() => {
-          if (!busy) void onChooseFolder();
-        }}
-        onKeyDown={(event) => {
-          if (event.target !== event.currentTarget || busy) return;
-          if (event.key === "Enter" || event.key === " ") {
-            event.preventDefault();
-            void onChooseFolder();
-          }
-        }}
-        tabIndex={0}
-        aria-label="写真フォルダをドロップするか、選ぶ"
-      >
-        <FolderMark />
-        <div>
-          <h2>{phase === "loading" ? "フォルダを読んでいます" : "フォルダをここにドロップ"}</h2>
-          <p>JPEG、PNG、WEBP、HEIC。フォルダの中のサブフォルダも、そのままの形で保存します。</p>
-        </div>
-        <div className="drop-actions">
+      <section className={dragging ? "step drop over" : "step"} aria-label="手順1 写真を選ぶ">
+        <h2>
+          <span>1</span>写真を選ぶ
+        </h2>
+        <p>
+          {phase === "loading"
+            ? "写真を読んでいます。そのままお待ちください。"
+            : phone
+              ? "カメラロールから、日付を入れたい写真を選んでください。"
+              : "日付を入れたい写真のフォルダを選んでください。"}
+        </p>
+        <div className="actions">
           <button
             type="button"
             className="primary"
             disabled={busy}
-            onClick={(event) => {
-              event.stopPropagation();
-              void onChooseFolder();
+            onClick={() => {
+              if (phone) fileInputRef.current?.click();
+              else void onChooseFolder();
             }}
           >
-            フォルダを選ぶ
+            {phone ? "カメラロールから選ぶ" : "フォルダを選ぶ"}
           </button>
-          <button
-            type="button"
-            className="text-button"
-            disabled={busy}
-            onClick={(event) => {
-              event.stopPropagation();
-              fileInputRef.current?.click();
-            }}
-          >
-            写真ファイルだけ選ぶ
-          </button>
+          {!phone && (
+            <button type="button" className="ghost" disabled={busy} onClick={() => fileInputRef.current?.click()}>
+              写真を選ぶ
+            </button>
+          )}
         </div>
+        <p className="note">{phone ? "何枚でも選べます。" : "フォルダを、この枠の中へ持ってきても選べます。"}</p>
       </section>
 
-      <input ref={folderInputRef} className="hidden-input" type="file" multiple onChange={(event) => void onFolderInput(event)} />
+      <input ref={folderInputRef} className="hidden-input" type="file" multiple aria-hidden="true" tabIndex={-1} onChange={(event) => void onFolderInput(event)} />
       <input
         ref={fileInputRef}
         className="hidden-input"
         type="file"
         accept="image/*"
         multiple
+        aria-hidden="true"
+        tabIndex={-1}
         onChange={(event) => void onFileInput(event)}
       />
 
-      <section className="sheet">
+      <section className="step" aria-label="手順2 日付の入れ方">
+        <h2>
+          <span>2</span>日付の入れ方を選ぶ
+        </h2>
         <div className="options">
           <fieldset>
-            <legend>表示</legend>
+            <legend>文字</legend>
             <div className="segmented" role="group" aria-label="日時の表示">
               <button type="button" aria-pressed={withTime} disabled={busy} onClick={() => setWithTime(true)}>
-                日時
+                {withTime ? "✓ 日付と時間" : "日付と時間"}
               </button>
               <button type="button" aria-pressed={!withTime} disabled={busy} onClick={() => setWithTime(false)}>
-                日付だけ
+                {!withTime ? "✓ 日付だけ" : "日付だけ"}
               </button>
             </div>
           </fieldset>
           <fieldset>
-            <legend>位置</legend>
+            <legend>場所</legend>
             <div className="segmented" role="group" aria-label="表示位置">
               {CORNERS.map((item) => (
                 <button
@@ -408,7 +450,7 @@ export default function App() {
                   disabled={busy}
                   onClick={() => setCorner(item.id)}
                 >
-                  {item.label}
+                  {corner === item.id ? `✓ ${item.label}` : item.label}
                 </button>
               ))}
             </div>
@@ -416,34 +458,33 @@ export default function App() {
         </div>
 
         <figure className="preview">
-          {preview ? <img src={preview.url} alt={preview.sample ? "日時を入れた見本" : "1枚目の仕上がりプレビュー"} /> : <div className="preview-empty">プレビューを準備しています</div>}
+          {preview ? <img src={preview.url} alt={preview.sample ? "日付を入れた見本" : "1枚目の仕上がり"} /> : <div className="preview-empty">見本を準備しています</div>}
           <figcaption>
-            {preview?.sample
-              ? "見本です。フォルダを入れると、1枚目の仕上がりに替わります。"
-              : "1枚目のプレビューです。この位置と表示を、すべての写真に使います。"}
-            {preview?.fileDate ? " この写真には撮影日時がなかったので、ファイルの更新日時を表示しています。" : ""}
+            {preview?.sample ? "これは見本です。写真を選ぶと、1枚目の仕上がりに替わります。" : "これが1枚目の仕上がりです。全部の写真が、この入れ方になります。"}
+            {preview?.fileDate ? " この写真には撮影した日時がなかったので、ファイルの日時を使います。" : ""}
           </figcaption>
         </figure>
+      </section>
 
-        {albums.length > 0 && phase !== "done" && (
+      <section className="step" aria-label="手順3 保存する">
+        <h2>
+          <span>3</span>保存する
+        </h2>
+        {albums.length === 0 ? (
+          <p>{phone ? "先に、上の「カメラロールから選ぶ」を押してください。" : "先に、上の「フォルダを選ぶ」を押してください。"}</p>
+        ) : (
           <div className="plan">
             {albums.map((album) => (
               <p key={album.id}>
                 <strong>{album.folderName}</strong>
                 <span>{album.images.length}枚</span>
-                <span className="arrow">→</span>
-                {album.handle ? (
-                  <span>
-                    {album.folderName} / {stampedFolderName(album.folderName)}
-                  </span>
-                ) : canPickDirectory() ? (
-                  <span>選んだフォルダの中の「フォルダ名タイムスタンプ済み」</span>
-                ) : (
-                  <span>{stampedFolderName(album.folderName)}.zip</span>
-                )}
               </p>
             ))}
-            <p className="note">元の写真は変更しません。同じ名前がすでにある場合は、その写真だけ上書きします。</p>
+            <p>
+              {phone
+                ? "元の写真はそのまま残ります。日付を入れた写真を、カメラロールに保存します。"
+                : "元の写真はそのまま残ります。日付を入れた写真は、新しいフォルダに入ります。"}
+            </p>
           </div>
         )}
 
@@ -459,8 +500,8 @@ export default function App() {
               <span style={{ width: `${percent}%` }} />
             </div>
             <p>
-              {progress.current} / {progress.total}枚
-              {progress.name ? `　${progress.name}` : ""}
+              {progress.current}枚目を処理しています。全部で{progress.total}枚です。
+              {progress.name ? ` ${progress.name}` : ""}
             </p>
             <button type="button" className="ghost" onClick={() => (cancelRef.current = true)}>
               中断する
@@ -470,19 +511,27 @@ export default function App() {
 
         {phase === "done" && result && (
           <div className="result" role="status">
-            <h2>{result.cancelled ? "ここまで保存しました" : result.saved.length > 0 ? "保存しました" : "保存できた写真がありません"}</h2>
+            <h3>
+              {result.cancelled
+                ? "ここまでできました"
+                : result.cameraBatches.length > result.sharedBatches || result.handSave.length > 0
+                  ? "日付を入れました"
+                  : result.saved.length > 0
+                    ? "保存できました"
+                    : "保存できた写真がありません"}
+            </h3>
             {result.saved.map((item) => (
               <p key={item.label}>
-                {item.count}枚を {item.label} {item.where === "folder" ? "に保存しました" : "としてダウンロードしました"}
+                {item.where === "folder"
+                  ? `${item.count}枚を ${item.label} に保存しました`
+                  : item.where === "camera"
+                    ? `${item.count}枚に日付を入れました`
+                    : `${item.count}枚を ${item.label} としてダウンロードしました`}
               </p>
             ))}
-            {result.saved.some((item) => item.where === "folder") && (
-              <p className="note">新しいフォルダは、選んだフォルダの中にできています。</p>
-            )}
-            {result.fellBackToZip && <p className="note">フォルダへの書き込みが許可されなかったため、ZIPでダウンロードしました。</p>}
-            {result.fileDates > 0 && (
-              <p className="note">撮影日時がなかった{result.fileDates}枚は、ファイルの更新日時を入れました。</p>
-            )}
+            {result.saved.some((item) => item.where === "folder") && <p>新しいフォルダは、選んだフォルダの中にできています。</p>}
+            {result.fellBackToZip && <p>フォルダに保存できなかったので、ダウンロードしました。</p>}
+            {result.fileDates > 0 && <p>撮影した日時がなかった{result.fileDates}枚は、ファイルの日時を入れました。</p>}
             {result.failures.length > 0 && (
               <div className="failures">
                 <p>処理できなかった写真が{result.failures.length}枚あります。</p>
@@ -493,42 +542,51 @@ export default function App() {
                 </ul>
               </div>
             )}
+            {result.cameraBatches.length > result.sharedBatches && (
+              <>
+                <p>下のボタンを押してください。出てきた画面で「画像を保存」を選ぶと、カメラロールに入ります。</p>
+                <button type="button" className="primary" onClick={() => void shareNextBatch()}>
+                  {result.cameraBatches.length === 1
+                    ? "カメラロールに保存"
+                    : `カメラロールに保存（${result.cameraBatches.slice(0, result.sharedBatches).reduce((sum, batch) => sum + batch.length, 0) + 1}〜${result.cameraBatches.slice(0, result.sharedBatches).reduce((sum, batch) => sum + batch.length, 0) + result.cameraBatches[result.sharedBatches].length}枚目）`}
+                </button>
+              </>
+            )}
+            {result.cameraBatches.length > 0 && result.sharedBatches >= result.cameraBatches.length && <p>カメラロールに保存しました。</p>}
+            {result.handSave.length > 0 && (
+              <div className="hand-save">
+                <p>写真を長く押して、「画像を保存」を選んでください。カメラロールに入ります。</p>
+                {result.handSave.map((item) => (
+                  <img key={item.url} src={item.url} alt={item.name} />
+                ))}
+              </div>
+            )}
             {result.downloads.map((item) => (
               <a key={item.name} className="download" href={item.url} download={item.name}>
-                {item.name} を再ダウンロード
+                もう一度ダウンロードする
               </a>
             ))}
           </div>
         )}
 
-        {phase !== "running" && albums.length > 0 && (
+        {phase !== "running" && !(result && result.cameraBatches.length > result.sharedBatches) && (
           <div className="actions">
-            <button type="button" className="primary" disabled={busy} onClick={() => void onSave()}>
-              {canWriteHere ? "同じフォルダの中に保存" : canChooseSaveFolder ? "保存先フォルダを選んで保存" : "ZIPでダウンロード"}
+            <button type="button" className="primary" disabled={busy || albums.length === 0} onClick={() => void onSave()}>
+              {phone ? "カメラロールに保存" : canWriteHere || canChooseSaveFolder || albums.length === 0 ? "保存する" : "ダウンロードする"}
             </button>
-            {(canWriteHere || canChooseSaveFolder) && (
-              <button type="button" className="ghost" disabled={busy} onClick={() => void processAlbums(albums, true)}>
-                ZIPでダウンロード
+            {!phone && albums.length > 0 && (canWriteHere || canChooseSaveFolder) && (
+              <button type="button" className="ghost" disabled={busy} onClick={() => void processAlbums(albums, "zip")}>
+                ダウンロードする
               </button>
             )}
-            <button type="button" className="ghost" onClick={reset}>
-              最初から
-            </button>
+            {albums.length > 0 && (
+              <button type="button" className="ghost" onClick={reset}>
+                最初からやり直す
+              </button>
+            )}
           </div>
         )}
       </section>
     </main>
-  );
-}
-
-function FolderMark() {
-  return (
-    <svg className="folder-mark" viewBox="0 0 64 64" aria-hidden="true">
-      <path d="M8 18.5h18l4 5H56v24.5a4 4 0 0 1-4 4H12a4 4 0 0 1-4-4V18.5Z" fill="#f4efe4" stroke="#1c1915" strokeWidth="2.4" />
-      <path d="M8 24h48" stroke="#1c1915" strokeWidth="2.4" />
-      <text x="32" y="42" textAnchor="middle" fontSize="9" fontWeight="700" fill="#1c1915">
-        10/08
-      </text>
-    </svg>
   );
 }
